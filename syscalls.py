@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, List, Dict, Type, Callable, TextIO
 from misc import MiscVM
 
 if TYPE_CHECKING :
-    from misc import Runtime
+    from misc import VMState as Runtime
 
 class OutputStream:
     """A file-like object that captures written characters and can optionally echo to stdout."""
@@ -73,7 +73,7 @@ class ExitSyscall(Syscall):
 
     def execute(self, rt: Runtime) -> Runtime:
         # Import locally to avoid circular dependency with runner.py
-        code = rt.reg[0].unsigned
+        code = rt.registers[0]
         raise MiscVM.Stop(code)
 
 
@@ -87,6 +87,6 @@ class PutcSyscall(Syscall):
         self.stream = stream
 
     def execute(self, rt: Runtime) -> Runtime:
-        char_code = rt.reg[0].unsigned
+        char_code = rt.registers[0]
         self.stream.write(char_code)
         return rt

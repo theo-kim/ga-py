@@ -34,11 +34,10 @@ except ImportError:
     plt = None
     progress = None
 
-from dataclasses import dataclass
-from typing import Dict, List, Literal, Tuple, Any
+from typing import Dict, List, Tuple, Any
 
 # --- Your VM must be importable (same directory or PYTHONPATH) ---
-from misc import Memory, MiscVM, Endian, VMResult  # noqa: F401
+from misc import MiscVM, Endian, VMResult  # noqa: F401
 from scorer import ScoredProgram
 from maze_game import Maze
 from maze_scorer import grade_maze_performance
@@ -50,13 +49,13 @@ from bar import RunnerProgress
 # ========= Syscalls ==========
 
 def initialize_syscalls(output_stream: OutputStream, maze: Maze | None = None) -> Dict[int, callable]:
-        """Initializes all registered syscalls and builds the systable."""
-        # This is a bit of a hack to handle two different sets of syscalls.
-        # In a larger project, you might use different entry points or config files.
-        kwargs = {'stream': output_stream}
-        if maze:
-            kwargs['maze'] = maze
-        return build_systable(**kwargs)
+    """Initializes all registered syscalls and builds the systable."""
+    # This is a bit of a hack to handle two different sets of syscalls.
+    # In a larger project, you might use different entry points or config files.
+    kwargs = {'stream': output_stream}
+    if maze:
+        kwargs['maze'] = maze
+    return build_systable(**kwargs)
 
 # ========== Assembly helpers ==========
 
@@ -66,39 +65,22 @@ def random_program_bytes(words: int) -> bytes:
 
 # ========== VM run wrapper ==========
 
-def run_one(index: int, program_words: List[int], maze: Maze, log: bool = True) -> VMResult:
+def run_one(_: int, program_words: List[int], maze: Maze, log: bool = False) -> VMResult:
     """Run a single program"""
     output_stream = OutputStream(log)
     systable = initialize_syscalls(output_stream, maze=maze)
 
-    vm = MiscVM(systable=systable)
-    return vm.run(program_words, max_steps=500) # Limit steps per run
+    return MiscVM(systable=systable).run(program_words, max_steps=500)
 
 
 # ========== Tally + summary ==========
 
-def summarize(results: List[VMResult]) -> Tuple[Dict[str, int], Dict[str, List[VMResult]]]:
-    buckets: Dict[str, int] = {"graceful": 0, "memory": 0, "pc": 0, "other": 0, "opcode": 0, "syscall": 0, "register": 0, "limit": 0}
-    by_kind: Dict[str, List[VMResult]] = {k: [] for k in buckets.keys()}
+def summarize(results: List[VMResult]) -> Dict[str, int]:
+    buckets: Dict[str, int] = { }
     for r in results:
-        kind = "other"
-        if not r.halted :
-            kind = "graceful"
-        if isinstance(r.error, Memory.Error) :
-            kind = "memory"
-        if isinstance(r.error, MiscVM.Error) :
-            if str(r.error) == "Illegal PC access" :
-                kind = "pc"
-            elif str(r.error).startswith("Unknown opcode") :
-                kind = "opcode"
-            elif str(r.error) == "Unknown syscall" :
-                kind = "syscall"
-            elif str(r.error) == "Runtime limit exceeded" :
-                kind = "limit" 
-            
-            buckets[kind] += 1
-        by_kind[kind].append(r)
-    return buckets, by_kind
+        buckets[str(r.error)] = buckets.get(str(r.error), 0) + 1
+        
+    return buckets
 
 # ========== CLI orchestration ==========
 
@@ -114,7 +96,7 @@ def plot_results(num_generations: int, final_scores: List[int], avg_scores: List
     print("\n--- Generating plot... ---")
     generations_x = range(1, num_generations + 1)
 
-    fig, ax = plt.subplots(figsize=(12, 7))
+    _, ax = plt.subplots(figsize=(12, 7))
 
     # 1. Scatter plot for final generation's individual scores
     final_gen_x = [num_generations] * len(final_scores)
@@ -141,7 +123,7 @@ def process_individual(args_tuple: Tuple[bytes, List[Maze], Endian, bool, int]) 
     Worker function to run a single program and score it.
     Designed to be used with multiprocessing.Pool.
     """
-    program_bytes, maze_test_set, endian, log, index = args_tuple
+    program_bytes, maze_test_set, _, log, index = args_tuple
 
     # Each worker process should have its own random seed.
     random.seed()
@@ -158,7 +140,7 @@ def process_individual(args_tuple: Tuple[bytes, List[Maze], Endian, bool, int]) 
 
 # ======== Test runtime =========
 
-def test(current_population: List[bytes], maze_test_set: List[Maze], endian: Endian, log: bool, **kwargs: Any) -> List[ScoredProgram]:
+def test(current_population: List[bytes], maze_test_set: List[Maze], endian: Endian, log: bool, **_: Any) -> List[ScoredProgram]:
     """Run a generational test"""
     # scored_population = [process_individual((program_bytes, maze_test_set, endian, log, i)) for i, program_bytes in enumerate(current_population)]
     tasks = [(program_bytes, maze_test_set, endian, log, i) for i, program_bytes in enumerate(current_population)]
@@ -169,6 +151,7 @@ def test(current_population: List[bytes], maze_test_set: List[Maze], endian: End
     return scored_population
 
 def main() -> None:
+    """main method"""
     ap = argparse.ArgumentParser(description="Fuzz random MISC programs with live progress and tallies.")
     ap.add_argument("--count", type=int, default=50, help="Number of programs to generate and run.")
     ap.add_argument("--fixed-words", type=int, default=None,
@@ -215,7 +198,7 @@ def main() -> None:
     if args.load_population:
         print(f"--- Loading population and mazes from {args.load_population} ---")
         try:
-            with open(args.load_population, 'r') as f:
+            with open(args.load_population, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
             # Load population
@@ -232,10 +215,10 @@ def main() -> None:
 
         except FileNotFoundError:
             ap.error(f"Population file not found: {args.load_population}")
-        except ValueError as e:
-            ap.error(f"Error decoding data in '{args.load_population}': {e}")
         except json.JSONDecodeError as e:
             ap.error(f"Error parsing JSON from '{args.load_population}': {e}")
+        except ValueError as e:
+            ap.error(f"Error decoding data in '{args.load_population}': {e}")
     else:
         program_lengths = make_lengths(args.count, args.fixed_words, args.min_words, args.max_words)
         current_population: List[bytes] = [random_program_bytes(wlen) for wlen in program_lengths]
@@ -255,7 +238,7 @@ def main() -> None:
     if args.csv_log:
         try:
             # Open the file in write mode, with newline='' to prevent extra blank rows
-            csv_file = open(args.csv_log, 'w', newline='')
+            csv_file = open(args.csv_log, 'w', newline='', encoding='utf-8')
             csv_writer = csv.writer(csv_file)
             # Write the header
             csv_writer.writerow(['generation', 'score'])
@@ -299,7 +282,7 @@ def main() -> None:
     # --- Final Summary ---
     final_gen_results = [sp.result for sp in scored_population]
     final_gen_scores = [sp.score for sp in scored_population]
-    totals, by_kind = summarize(final_gen_results)
+    totals = summarize(final_gen_results)
 
     if final_gen_scores:
         total_score = sum(final_gen_scores)
@@ -334,7 +317,7 @@ def main() -> None:
             "mazes": [m.to_dict() for m in maze_test_set]
         }
         try:
-            with open(args.save_population, 'w') as f:
+            with open(args.save_population, 'w', encoding='utf-8') as f:
                 json.dump(save_data, f, indent=2)
         except Exception as e:
             print(f"Error saving population file: {e}", file=sys.stderr)
@@ -348,8 +331,8 @@ def main() -> None:
             plot_results(args.generations, final_gen_scores, generation_avg_scores)
 
     print("=== Run Summary ===")
-    for k in totals.keys():
-        print(f"{k:14s}: {totals[k]}")
+    for k, v in totals.items():
+        print(f"{k:14s}: {v}")
 
 
 if __name__ == "__main__":

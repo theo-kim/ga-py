@@ -73,7 +73,8 @@ class GeneticAlgo() :
         if self.point_mutation_rate == 0:
             return program_bytes
         
-        mutated_bits = bitarray.bitarray(program_bytes, endian=self.endian)
+        mutated_bits = bitarray.bitarray()
+        mutated_bits.frombytes(program_bytes)
         
         i = 0
         while i < len(mutated_bits) : 

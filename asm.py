@@ -11,14 +11,19 @@ Usage:
 
 import argparse
 import re
+import ctypes
 import sys
-from bitarray import bitarray
-from bitarray.util import int2ba
 import struct
 
-# Import the instruction set definition from the VM
-from misc import MiscVM
+# --- Debug Logging ---
+DBG = False
+def d_print(*args, **kwargs):
+    if not DBG:
+        return
+    print("[ASM DBG]", *args, **kwargs, file=sys.stderr)
 
+# Import the instruction set definition from the VM
+from misc import vm_core
 
 def parse_operand(op: str, labels: dict[str, int]) -> int:
     """Parses an operand string into an integer value."""
@@ -38,21 +43,21 @@ def parse_operand(op: str, labels: dict[str, int]) -> int:
 
     if op.lower() in labels:
         return labels[op.lower()]
+    
+    # Handle registers (r5 -> 5)
     if op.lower().startswith('r'):
         return int(op[1:])
-    if op.lower().startswith('0x'):
-        return int(op[2:], 16)
-    if op.lower().startswith('0b'):
-        return int(op[2:], 2)
     
-    # Default to decimal integer
-    return int(op) 
-
+    # Handle hex (0x10), binary (0b10), and decimal (10)
+    return int(op, 0)
 
 def assemble(source_code: str) -> bytes:
     """
     Assembles the given source code into a byte string.
+    Python handles the two-pass assembly (labels), and calls the C core
+    to assemble each individual instruction.
     """
+    d_print("--- Starting Assembly ---")
     lines = source_code.splitlines()
     code_lines = []
     data_pairs = []
@@ -62,115 +67,114 @@ def assemble(source_code: str) -> bytes:
     program_counter = 0
     in_data_section = False
 
-    for line in lines:
+    d_print("\n--- Pass 1: Parsing labels and data ---")
+    for i, line in enumerate(lines):
         line = line.split('#', 1)[0].strip()
         if not line:
             continue
 
         if line.lower() == '.data':
+            d_print(f"L{i+1}: Entering .data section")
             in_data_section = True
             continue
-        elif line.lower() == '.text': # Or any other section start
+        elif line.lower() == '.text':
+            d_print(f"L{i+1}: Entering .text section")
             in_data_section = False
             continue
 
         if in_data_section:
-            try:
-                parts = line.split(maxsplit=2)
-                data_type, addr_str, val_str = parts
-                addr = parse_operand(addr_str, {}) # No labels in data addresses yet
+            # Try to match 'byte ADDR, VAL'
+            byte_match = re.match(r'byte\s+([^,]+),\s*(.+)', line, re.IGNORECASE)
+            # Try to match 'str ADDR, "string"'
+            str_match = re.match(r'str\s+([^,]+),\s*"([^"]*)"', line, re.IGNORECASE)
+            if byte_match:
+                addr_str, val_str = byte_match.groups()
+                addr = parse_operand(addr_str, {})
+                val = parse_operand(val_str, {})
+                d_print(f"L{i+1}: Found data: byte @{addr}, {val}")
+                data_pairs.append((addr, val))
+            elif str_match:
+                addr_str, raw_string_literal = str_match.groups()
+                start_addr = parse_operand(addr_str, {})
                 
-                if data_type.lower() == 'byte':
-                    val = parse_operand(val_str, {})
-                    data_pairs.append((addr, val))
-                elif data_type.lower() == 'str':
-                    # Use regex to find all literals (chars or numbers)
-                    vals = re.findall(r"'.*?'|\S+", val_str)
-                    for i, v_str in enumerate(vals):
-                        val = parse_operand(v_str, {})
-                        data_pairs.append((addr + i, val))
-                continue # Move to the next line after processing data
-            except (ValueError, IndexError):
-                # If parsing as data fails, assume it's the start of the code section
-                in_data_section = False
+                # Process escape sequences in the string literal
+                try:
+                    # The 'unicode_escape' codec is perfect for this
+                    processed_string = raw_string_literal.encode('latin1').decode('unicode_escape')
+                except UnicodeDecodeError as e:
+                    raise ValueError(f"Invalid escape sequence in string on line {i+1}: {e}")
 
-        # This part now runs for all code lines
-        if not in_data_section:
-            match = re.match(r'^([a-zA-Z0-9_]+):$', line)
-            if match:
-                label_name = match.group(1).lower()
-                if label_name in labels:
-                    raise ValueError(f"Duplicate label found: {label_name}")
-                # The PC for labels needs to account for the data section
-                labels[label_name] = program_counter
-            else:
-                code_lines.append(line)
-                program_counter += MiscVM.INSTRUCTION_LENGTH
+                d_print(f"L{i+1}: Found data: str @{start_addr}, \"{raw_string_literal}\" -> (len: {len(processed_string)})")
+                for j, char in enumerate(processed_string):
+                    addr = start_addr + j
+                    val = ord(char)
+                    d_print(f"  -> generating: byte @{addr}, {val} ('{char}')")
+                    data_pairs.append((addr, val))
+
+            continue
+
+        match = re.match(r'^([a-zA-Z0-9_]+):$', line)
+        if match:
+            label_name = match.group(1).lower()
+            if label_name in labels:
+                raise ValueError(f"Duplicate label found: {label_name}")
+            d_print(f"L{i+1}: Found label '{label_name}' at address {program_counter}")
+            labels[label_name] = program_counter
+        else:
+            code_lines.append(line)
+            program_counter += 2 # Each instruction is 2 bytes
     
     # --- Second Pass: Assemble instructions and data ---
     output_bytes = bytearray()
 
+    d_print("\n--- Pass 2: Generating machine code ---")
     # Assemble .data section if it exists
     if data_pairs:
-        # OP_RAW_DUMP instruction (0xFF00)
-        output_bytes.extend(b'\x0f\xff')
+        output_bytes.extend(b'\xf0\xff') # MEMLOAD instruction
         for addr, val in data_pairs:
             output_bytes.extend([addr & 0xFF, val & 0xFF])
-        # Terminator for raw dump mode
-        output_bytes.extend(b'\x00\x00')
+        output_bytes.extend(b'\x00\x00') # Terminator
     
     # Adjust labels to account for the data section length
     data_section_len = len(output_bytes)
+    d_print(f"Data section is {data_section_len} bytes long.")
     for label in labels:
         labels[label] += data_section_len
+        d_print(f"Adjusted label '{label}' to address {labels[label]}")
     
-    # Assemble code section
+    d_print("\nAssembling code section:")
     for line_num, line in enumerate(code_lines, 1):
-        parts = re.split(r'[,\s]+', line, 1)
-        parts = line.split(maxsplit=1)
+        parts = re.split(r'[,\s]+', line.strip(), maxsplit=1)
         mnemonic = parts[0].upper()
         args_str = parts[1] if len(parts) > 1 else ""
+        operands = [op.strip() for op in args_str.split(',') if op.strip()]
         
-        instruction_bits = bitarray(endian="big")
-        found_op = False
-        for name, op_code_bytes, arg_type, _, imm_type, _ in MiscVM.OPS:
-            op_name = name.split('_', 1)[1] # e.g., OP_MOV_REG_IMM -> MOV_REG_IMM
-            if mnemonic != op_name.rsplit('_', 2)[0] and mnemonic != op_name.rsplit('_',1)[0] and mnemonic != op_name:
-                 if not (mnemonic == "MOV" and op_name.startswith("MOV")):
-                    continue
-            op_bits = bitarray(endian="big")
-            op_bits.frombytes(op_code_bytes)
-            instruction_bits += op_bits[-MiscVM.OP_LEN:]
-            
-            try:
-                operands = [op.strip() for op in args_str.split(',') if op.strip()]
-                
-                if arg_type == MiscVM.OpArg.I:
-                    i = parse_operand(operands[0], labels) if operands else 0
-                    i_bytes = struct.pack("".join([ "<" if MiscVM.ENDIAN == "little" else ">", "h" if i < 0 else "H" ]), i)
-                    instruction_bits += bitarray(i_bytes)[MiscVM.OP_LEN:]
-                
-                elif arg_type == MiscVM.OpArg.RI:
-                    d_i = parse_operand(operands[0], labels)
-                    i = parse_operand(operands[1], labels)
-                    i_bytes = struct.pack("".join([ "<" if MiscVM.ENDIAN == "little" else ">", "b" if i < 0 else "B" ]), i)
-                    instruction_bits += int2ba(d_i, MiscVM.REG_LEN) + bitarray(i_bytes)
+        # Resolve labels to integer strings
+        resolved_ops = [parse_operand(op, labels) for op in operands]
+        d_print(f"L{line_num}: '{line.strip()}' -> {mnemonic} {', '.join(str(op) for op in resolved_ops if op)}")
+        
+        # Pad with None for C function signature
+        while len(resolved_ops) < 3:
+            resolved_ops.append(0) # Pass 0 for unused operands
 
-                elif arg_type == MiscVM.OpArg.RRI:
-                    d_i = parse_operand(operands[0], labels)
-                    s_i = parse_operand(operands[1], labels)
-                    i = parse_operand(operands[2], labels) if len(operands) > 2 else 0
-                    instruction_bits += int2ba(d_i, MiscVM.REG_LEN) + int2ba(s_i, MiscVM.REG_LEN) + int2ba(i, MiscVM.REG_LEN, signed=i < 0)
-                
-                output_bytes.extend(instruction_bits.tobytes())
-                found_op = True
-                break
-            except (ValueError, IndexError) as e:
-                # This was not the correct operator overload, try the next one
-                continue
+        c_ops = [ctypes.c_uint16(op) for op in resolved_ops]
+        c_mnemonic = ctypes.c_char_p(mnemonic.encode('ascii'))
+        output_instruction = ctypes.c_uint16()
+        error_ptr = ctypes.c_char_p()
 
-        if not found_op:
-            raise ValueError(f"L{line_num}: Invalid instruction or operands: '{line}'")
+        result = vm_core.assemble_instruction(c_mnemonic, *c_ops, ctypes.byref(output_instruction), ctypes.byref(error_ptr))
+
+        if result != 0:
+            error_msg = error_ptr.value.decode('utf-8') if error_ptr.value else f"Unknown assembly error on line {line_num}"
+            if error_ptr: vm_core.free_memory(error_ptr)
+            raise ValueError(f"L{line_num}: {error_msg} in '{line}'")
+
+        # Pack as big-endian
+        instruction_bytes = struct.pack('<H', output_instruction.value)
+        output_bytes.extend(instruction_bytes)
+        d_print(f"  -> Encoded as: 0x{instruction_bytes.hex()}")
+
+    d_print("\n--- Assembly Finished ---")
     return bytes(output_bytes)
 
 
@@ -178,21 +182,24 @@ def main():
     parser = argparse.ArgumentParser(description="Assembler for MISC v3 architecture.")
     parser.add_argument("input_file", help="Path to the assembly source file (.asm).")
     parser.add_argument("-o", "--output", help="Path to the output hex file. Defaults to stdout.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
     args = parser.parse_args()
 
     try:
+        if args.debug:
+            global DBG
+            DBG = True
+
         with open(args.input_file, 'r') as f:
             source = f.read()
         
         machine_code = assemble(source)
-        # print(machine_code)
         hex_output = machine_code.hex()
-        # print(bytes.fromhex(hex_output))
 
         if args.output:
-            with open(args.output, 'w') as f:
+            with open(args.output, 'wb') as f: # Write bytes
                 f.write(machine_code)
-            print(f"Successfully assembled {args.input_file} to {args.output}")
+            print(f"Successfully assembled {args.input_file} to {args.output} ({len(machine_code)} bytes)", file=sys.stderr)
         else:
             print(hex_output)
 
